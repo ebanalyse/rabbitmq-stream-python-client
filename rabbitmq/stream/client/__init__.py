@@ -1,7 +1,7 @@
 import struct
 
 from abc import ABC
-from dataclasses import dataclass, field, fields
+from dataclasses import InitVar, dataclass, field, fields
 from typing import (
     Any,
     Callable,
@@ -9,6 +9,7 @@ from typing import (
     Generic,
     List,
     Literal,
+    Optional,
     Protocol,
     Tuple,
     Type,
@@ -21,11 +22,11 @@ T = TypeVar("T", bound=SupportsBytes)
 
 
 class BytesReader(Protocol):
-    from_bytes: Callable[[bytes], Tuple[Any, int]]
+    from_bytes: Callable[[bytes], Tuple[SupportsBytes, int]]
 
 
 @dataclass
-class BaseInt(SupportsBytes, BytesReader):
+class BaseInt:
     value: int
     format: ClassVar[str]
     byte_size: ClassVar[int]
@@ -92,7 +93,7 @@ class UInt64(BaseInt):
 
 
 @dataclass
-class Bytes(SupportsBytes):
+class Bytes:
     value: bytes
 
     def __bytes__(self) -> bytes:
@@ -102,12 +103,12 @@ class Bytes(SupportsBytes):
 
 
 @dataclass
-class String(SupportsBytes):
+class String:
     value: Union[str, None]
 
     @classmethod
     def from_bytes(cls, data: bytes):
-        length, offset = Int16.from_bytes(data[:2])
+        length, offset = Int16.from_bytes(data)
         value = b"".join(
             struct.unpack("c" * int(length), data[offset : offset + int(length)])
         )
@@ -154,16 +155,32 @@ class Array(Generic[T]):
 
 @dataclass
 class ArrayBytesReader:
-    type: Type[BytesReader]
+    type: Type[Union[BytesReader, "AutoBytes"]]
+    length_prefix: bool = True
+    length: InitVar[int] = 0
 
     def from_bytes(self, data: bytes):
-        length, offset = Int32.from_bytes(data[:4])
         items = []
-        for _ in range(int(length)):
-            item, item_offset = self.type.from_bytes(data[offset:])
-            items.append(item)
-            offset += item_offset
+        if self.length_prefix or self.length:
+            if self.length_prefix:
+                length, offset = Int32.from_bytes(data)
+            else:
+                length = self.length
+                offset = 0
+            for _ in range(int(length)):
+                item, item_offset = self.type.from_bytes(data[offset:])
+                items.append(item)
+                offset += item_offset
+        else:
+            offset: int = 0
+            while offset != len(data):
+                item, item_offset = self.type.from_bytes(data[offset:])
+                items.append(item)
+                offset += item_offset
         return Array(items), offset
+
+    def copy(self):
+        return ArrayBytesReader(self.type, self.length_prefix, self.length)
 
 
 class AutoBytes:
@@ -181,11 +198,7 @@ class AutoBytes:
     ) -> Tuple[Union[SupportsBytes, BytesReader, "AutoBytes"], int]:
         offset: int = 0
         items = []
-        for field in cls.get_class_fields():
-            if field.metadata.get("reader") is not None:
-                reader = field.metadata["reader"]
-            else:
-                reader = field.type
+        for _, reader in cls.get_field_readers(items):
             item, additional_offset = reader.from_bytes(data[offset:])
             items.append(item)
             offset += additional_offset
@@ -194,6 +207,15 @@ class AutoBytes:
 
     def get_instance_fields(self):
         return fields(self)
+
+    @classmethod
+    def get_field_readers(cls, items: List[SupportsBytes]):
+        for field in cls.get_class_fields():
+            if field.metadata.get("reader") is not None:
+                reader = field.metadata["reader"]
+            else:
+                reader = field.type
+            yield field, reader
 
     @classmethod
     def get_class_fields(cls):
@@ -311,3 +333,286 @@ class Subscribe(AutoBytes):
     offset_specification: OffsetSpecification
     credit: UInt16
     properties: Array[Property] = field(metadata={"reader": ArrayBytesReader(Property)})
+
+
+@dataclass
+class Deliver(AutoBytes):
+    @dataclass
+    class OsirisChunk(AutoBytes):
+        @dataclass
+        class Message(AutoBytes):
+            pass
+
+        magic_version: Int8
+        num_entries: UInt16
+        num_records: UInt32
+        epoch: UInt64
+        chunk_first_offset: UInt64
+        chunk_crc: Int32
+        data_length: UInt32
+        messages: Array[Message] = field(
+            metadata={"reader": ArrayBytesReader(Message, length_prefix=False)}
+        )
+
+        @classmethod
+        def get_field_readers(cls, items: List[SupportsBytes]):
+            for field, reader in super().get_field_readers(items):
+                if field.name == "messages":
+                    reader = reader.copy()
+                    reader.length = int(items[1])  # type: ignore
+                yield field, reader
+
+    key: UInt16
+    version: UInt32
+    subscription_id: UInt8
+    osiris_chunk: OsirisChunk
+
+
+@dataclass
+class CreditRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    subscription_id: UInt8
+    credit: UInt16
+
+
+@dataclass
+class CreditResponse(AutoBytes):
+    key: UInt16
+    version: UInt16
+    response_code: UInt16
+    subscription_id: UInt8
+
+
+@dataclass
+class StoreOffset(AutoBytes):
+    key: UInt16
+    version: UInt16
+    reference: String
+    stream: String
+    offset: UInt64
+
+
+@dataclass
+class QueryOffsetRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    reference: String
+    stream: String
+
+
+@dataclass
+class QueryOffsetResponse(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    response_code: UInt16
+    offset: UInt64
+
+
+@dataclass
+class Unsubscribe(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    subscription_id: UInt8
+
+
+@dataclass
+class Create(AutoBytes):
+    @dataclass
+    class Argument(AutoBytes):
+        key: String
+        value: String
+
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    stream: String
+    arguments: Array[Argument] = field(metadata={"reader": ArrayBytesReader(Argument)})
+
+
+@dataclass
+class Delete(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    stream: String
+
+
+@dataclass
+class MetadataQuery(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    stream: String
+
+
+@dataclass
+class MetadataResponse(AutoBytes):
+    @dataclass
+    class Broker(AutoBytes):
+        reference: UInt16
+        host: String
+        port: UInt32
+
+    @dataclass
+    class StreamMetadata(AutoBytes):
+        stream_name: String
+        response_code: UInt16
+        leader_reference: UInt16
+        replicas_references: Array[UInt16] = field(
+            metadata={"reader": ArrayBytesReader(UInt16)}
+        )
+
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    brokers: Array[Broker] = field(metadata={"reader": ArrayBytesReader(Broker)})
+    stream_metadata: Array[StreamMetadata] = field(
+        metadata={"reader": ArrayBytesReader(StreamMetadata)}
+    )
+
+
+@dataclass
+class MetadataUpdate(AutoBytes):
+    @dataclass
+    class MetadataInfo(AutoBytes):
+        code: UInt16
+        stream: String
+
+    key: UInt16
+    version: UInt16
+    metadata_info: MetadataInfo
+
+
+@dataclass
+class PeerProperty(AutoBytes):
+    key: String
+    value: String
+
+
+@dataclass
+class PeerPropertiesRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    peer_properties: Array[PeerProperty] = field(
+        metadata={"reader": ArrayBytesReader(PeerProperty)}
+    )
+
+
+@dataclass
+class PeerPropertiesResponse(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    response_code: UInt16
+    peer_properties: Array[PeerProperty] = field(
+        metadata={"reader": ArrayBytesReader(PeerProperty)}
+    )
+
+
+@dataclass
+class SaslHandshakeRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+
+
+@dataclass
+class SaslHandshakeResponse(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt16
+    response_code: UInt16
+    mechanisms: Array[String] = field(metadata={"reader": ArrayBytesReader(String)})
+
+
+@dataclass
+class SaslAuthenticateRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    mechanism: String
+    sasl_opaque_data: Bytes
+
+
+@dataclass
+class SaslAuthenticateResponse(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    response_code: UInt16
+    sasl_opaque_data: Bytes
+
+
+@dataclass
+class TuneRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    frame_max: UInt32
+    heartbeat: UInt32
+
+
+@dataclass
+class TuneResponse(TuneRequest):
+    pass
+
+
+@dataclass
+class OpenRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    virtual_host: String
+
+
+@dataclass
+class OpenResponse(AutoBytes):
+    @dataclass
+    class ConnectionProperty(AutoBytes):
+        key: String
+        value: String
+
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    response_code: UInt16
+    connection_properties: Array[ConnectionProperty] = field(
+        metadata={"reader": ArrayBytesReader(ConnectionProperty)}
+    )
+
+
+@dataclass
+class CloseRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    closing_code: UInt16
+    closing_reason: String
+
+
+@dataclass
+class CloseResponse(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    response_code: UInt16
+
+
+@dataclass
+class Hearbeat(AutoBytes):
+    key: UInt16
+    version: UInt16
+
+
+@dataclass
+class Frame(Generic[T], AutoBytes):
+    value: T
+
+    def __bytes__(self):
+        data = super().__bytes__()
+        size = UInt32(len(data))
+        return bytes(size) + data
