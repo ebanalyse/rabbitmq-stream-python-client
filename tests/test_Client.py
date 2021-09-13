@@ -35,6 +35,9 @@ def test_Client():
     key, _ = UInt16.from_bytes(data)
     key = int(key) & 0b0111111111111111
     data = socket.recv(int(size) - UInt16.byte_size)
+    response: PeerPropertiesResponse
     response, offset = PeerPropertiesResponse.from_bytes(bytes(UInt16(key)) + data)
-    print(response)
+    assert int(response.key) == 17
+    assert int(response.version) == 1
+    assert int(response.correlation_id) == 100
     socket.close()
