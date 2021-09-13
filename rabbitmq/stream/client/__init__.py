@@ -1,6 +1,7 @@
 import struct
 
-from dataclasses import dataclass, fields
+from abc import ABC
+from dataclasses import dataclass, field, fields
 from typing import (
     Any,
     Callable,
@@ -14,7 +15,6 @@ from typing import (
     TypeVar,
     SupportsBytes,
     Union,
-    _GenericAlias,
 )
 
 T = TypeVar("T", bound=SupportsBytes)
@@ -159,7 +159,7 @@ class ArrayBytesReader:
     def from_bytes(self, data: bytes):
         length, offset = Int32.from_bytes(data[:4])
         items = []
-        for i in range(int(length)):
+        for _ in range(int(length)):
             item, item_offset = self.type.from_bytes(data[offset:])
             items.append(item)
             offset += item_offset
@@ -170,23 +170,34 @@ class AutoBytes:
     def __bytes__(self) -> bytes:
         data: bytes = bytes()
 
-        for field in fields(self):
+        for field in self.get_instance_fields():
             data += bytes(getattr(self, field.name))
 
         return data
 
     @classmethod
-    def from_bytes(cls, data: bytes):
-        offset = 0
+    def from_bytes(
+        cls, data: bytes
+    ) -> Tuple[Union[SupportsBytes, BytesReader, "AutoBytes"], int]:
+        offset: int = 0
         items = []
-        for field in fields(cls):
-            typ = field.type
-            if isinstance(typ, _GenericAlias) and typ.__origin__ is Array:
-                typ = ArrayBytesReader(typ.__args__[0])
-            item, additional_offset = typ.from_bytes(data[offset:])
+        for field in cls.get_class_fields():
+            if field.metadata.get("reader") is not None:
+                reader = field.metadata["reader"]
+            else:
+                reader = field.type
+            item, additional_offset = reader.from_bytes(data[offset:])
             items.append(item)
             offset += additional_offset
-        return cls(*items), offset  # type: ignore
+        instance = cls(*items)  # type: ignore
+        return instance, offset
+
+    def get_instance_fields(self):
+        return fields(self)
+
+    @classmethod
+    def get_class_fields(cls):
+        return fields(cls)
 
 
 @dataclass
@@ -195,7 +206,9 @@ class DeclarePublisherRequest(AutoBytes):
     version: UInt16
     correlation_id: UInt32
     publisher_id: UInt8
-    publisher_references: Array[String]
+    publisher_references: Array[String] = field(
+        metadata={"reader": ArrayBytesReader(String)}
+    )
     stream: String
 
 
@@ -218,7 +231,9 @@ class Publish(AutoBytes):
     key: UInt16
     version: UInt16
     publisher_id: UInt8
-    published_messages: Array[PublishedMessage]
+    published_messages: Array[PublishedMessage] = field(
+        metadata={"reader": ArrayBytesReader(PublishedMessage)}
+    )
 
 
 @dataclass
@@ -226,4 +241,73 @@ class PublishConfirm(AutoBytes):
     key: UInt16
     version: UInt16
     publisher_id: UInt8
-    publishing_ids: Array[UInt64]
+    publishing_ids: Array[UInt64] = field(metadata={"reader": ArrayBytesReader(UInt64)})
+
+
+@dataclass
+class PublishError(AutoBytes):
+    @dataclass
+    class PublishingError(AutoBytes):
+        publishing_id: UInt64
+        code: UInt16
+
+    key: UInt16
+    version: UInt16
+    publisher_id: UInt8
+    publishing_error: PublishingError
+
+
+@dataclass
+class QueryPublisherRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    publisher_reference: String
+    stream: String
+
+
+@dataclass
+class QueryPublisherResponse(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    response_code: UInt16
+    sequence: UInt64
+
+
+@dataclass
+class DeletePublisherRequest(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    publisher_id: UInt8
+
+
+@dataclass
+class DeletePublisherResponse(AutoBytes):
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    response_code: UInt16
+
+
+@dataclass
+class Subscribe(AutoBytes):
+    @dataclass
+    class OffsetSpecification(AutoBytes):
+        offset_type: UInt16
+        offset: UInt64
+
+    @dataclass
+    class Property(AutoBytes):
+        key: String
+        value: String
+
+    key: UInt16
+    version: UInt16
+    correlation_id: UInt32
+    subscription_id: UInt8
+    stream: String
+    offset_specification: OffsetSpecification
+    credit: UInt16
+    properties: Array[Property] = field(metadata={"reader": ArrayBytesReader(Property)})
