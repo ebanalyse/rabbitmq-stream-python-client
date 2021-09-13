@@ -227,8 +227,3 @@ class PublishConfirm(AutoBytes):
     version: UInt16
     publisher_id: UInt8
     publishing_ids: Array[UInt64]
-
-
-command = PublishConfirm.from_bytes(
-    bytes(PublishConfirm(UInt16(1), UInt16(1), UInt8(1), Array([UInt64(1)])))
-)
